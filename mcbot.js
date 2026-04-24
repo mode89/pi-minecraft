@@ -25,6 +25,9 @@
 // the script settles, when the client disconnects, or when the deadline
 // expires. Game/world state (position, health, inventory, broken/placed
 // blocks) is never touched.
+//
+// GET http://<http>/listen streams Minecraft chat messages as newline-delimited
+// JSON using chunked transfer encoding.
 
 const http = require("http");
 const mineflayer = require("mineflayer");
@@ -96,7 +99,8 @@ function main() {
   const server = createServer(bot, config);
   server.listen(config.httpPort, config.httpHost, () => {
     console.log(
-      `[http] listening on http://${config.httpHost}:${config.httpPort}/eval`,
+      `[http] listening on http://${config.httpHost}:${config.httpPort} `
+        + `(/eval, /listen)`,
     );
   });
 }
@@ -152,11 +156,20 @@ function createServer(bot, config) {
   // Serialize /eval requests: instance-level method patches cannot safely
   // interleave. One bot, one request at a time.
   const queue = createMutex();
+  const chatBroadcaster = createChatBroadcaster(bot);
 
   return http.createServer(async (req, res) => {
-    if (req.method !== "POST" || req.url !== "/eval") {
+    const url = req.url ? new URL(req.url, "http://localhost") : null;
+    const pathname = url ? url.pathname : req.url;
+
+    if (req.method === "GET" && pathname === "/listen") {
+      handleListen(chatBroadcaster, req, res);
+      return;
+    }
+
+    if (req.method !== "POST" || pathname !== "/eval") {
       res.writeHead(404, { "Content-Type": "text/plain" });
-      res.end("POST JS to /eval\n");
+      res.end("POST JS to /eval or GET /listen\n");
       return;
     }
 
@@ -170,6 +183,50 @@ function createServer(bot, config) {
 
     await queue(() => handleEval(bot, config, req, res, code));
   });
+}
+
+function createChatBroadcaster(bot) {
+  const clients = new Set();
+  bot.on("chat", (username, message, translate, jsonMsg, matches) => {
+    const event = {
+      type: "chat",
+      username,
+      message,
+      timestamp: new Date().toISOString(),
+    };
+    if (translate !== undefined) event.translate = translate;
+    if (matches !== undefined) event.matches = matches;
+    if (jsonMsg !== undefined && jsonMsg !== null) {
+      event.json = typeof jsonMsg.toString === "function"
+        ? jsonMsg.toString()
+        : jsonMsg;
+    }
+    broadcastJsonLine(clients, event);
+  });
+  return clients;
+}
+
+function handleListen(clients, _req, res) {
+  res.writeHead(200, {
+    "Content-Type": "application/x-ndjson; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "Transfer-Encoding": "chunked",
+  });
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+  clients.add(res);
+  res.on("close", () => clients.delete(res));
+}
+
+function broadcastJsonLine(clients, event) {
+  const line = JSON.stringify(event) + "\n";
+  for (const client of clients) {
+    if (client.writableEnded || client.destroyed) {
+      clients.delete(client);
+      continue;
+    }
+    client.write(line);
+  }
 }
 
 async function handleEval(bot, config, req, res, code) {
@@ -705,6 +762,9 @@ module.exports = {
   parseHostPort,
   createBot,
   createServer,
+  createChatBroadcaster,
+  handleListen,
+  broadcastJsonLine,
   handleEval,
   readBody,
   writeIfOpen,

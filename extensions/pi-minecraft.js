@@ -6,6 +6,12 @@ module.exports = function minecraftExtension(pi) {
   const packageRoot = path.resolve(__dirname, "..");
   const botScript = path.join(packageRoot, "mcbot.js");
   const systemPromptPath = path.join(packageRoot, "system.md");
+  let chatListener = null;
+
+  pi.on("session_shutdown", () => {
+    stopChatListener(chatListener);
+    chatListener = null;
+  });
 
   pi.on("before_agent_start", async (event, ctx) => {
     const state = await readStateIfExists(ctx.cwd);
@@ -39,7 +45,17 @@ module.exports = function minecraftExtension(pi) {
     handler: async (args, ctx) => {
       const state = await readState(ctx.cwd);
       if (state && isManagedProcess(state.pid, botScript)) {
-        notify(ctx, `mcbot already running: pid ${state.pid}`, "info");
+        chatListener = ensureChatListener(
+          pi,
+          ctx,
+          chatListener,
+          state.http || "localhost:3000",
+        );
+        notify(
+          ctx,
+          `mcbot already running: pid ${state.pid}; listening for chat`,
+          "info",
+        );
         return;
       }
 
@@ -76,11 +92,12 @@ module.exports = function minecraftExtension(pi) {
         10000,
       );
       if (probe.status === "ready") {
+        chatListener = ensureChatListener(pi, ctx, chatListener, nextState.http);
         notify(
           ctx,
           `started mcbot: pid ${child.pid}; /eval is ready; `
-            + `Minecraft bot instructions will be injected into future `
-            + `prompts; log ${relative(ctx.cwd, logPath)}`,
+            + `listening for Minecraft chat; bot instructions will be `
+            + `injected into future prompts; log ${relative(ctx.cwd, logPath)}`,
           "success",
         );
         return;
@@ -117,6 +134,8 @@ module.exports = function minecraftExtension(pi) {
         return;
       }
 
+      stopChatListener(chatListener);
+      chatListener = null;
       process.kill(state.pid, "SIGTERM");
       const stopped = await waitForExit(state.pid, 3000);
       if (!stopped && isManagedProcess(state.pid, botScript)) {
@@ -154,18 +173,91 @@ module.exports = function minecraftExtension(pi) {
 
       const http = state.http || "localhost:3000";
       const reachable = await isHttpReachable(http);
+      const listening = chatListener && chatListener.hostPort === http;
       const lines = [
         `mcbot status: running`,
         `pid: ${state.pid}`,
         `started: ${state.startedAt || "unknown"}`,
         `http: http://${http}/eval `
           + `(${reachable ? "reachable" : "not reachable yet"})`,
+        `chat listener: ${listening ? "connected" : "not connected"}`,
         `log: ${relative(ctx.cwd, state.logPath || getLogPath(ctx.cwd))}`,
       ];
       notify(ctx, lines.join("\n"), reachable ? "success" : "warning");
     },
   });
 };
+
+function ensureChatListener(pi, ctx, current, hostPort) {
+  if (current && current.hostPort === hostPort) return current;
+  stopChatListener(current);
+
+  const controller = new AbortController();
+  const listener = { hostPort, controller };
+  runChatListener(pi, ctx, hostPort, controller.signal).catch((error) => {
+    if (controller.signal.aborted) return;
+    notify(ctx, `Minecraft chat listener stopped: ${error.message}`, "error");
+  });
+  return listener;
+}
+
+function stopChatListener(listener) {
+  if (listener && listener.controller) listener.controller.abort();
+}
+
+async function runChatListener(pi, ctx, hostPort, signal) {
+  const response = await fetch(`http://${hostPort}/listen`, { signal });
+  if (!response.ok) {
+    throw new Error(`GET /listen failed: HTTP ${response.status}`);
+  }
+  if (!response.body) throw new Error("GET /listen returned no body");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  while (!signal.aborted) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error("GET /listen ended");
+    buffered += decoder.decode(value, { stream: true });
+    let newline;
+    while ((newline = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, newline);
+      buffered = buffered.slice(newline + 1);
+      if (line.trim()) sendChatTurn(pi, ctx, line);
+    }
+  }
+}
+
+function sendChatTurn(pi, ctx, line) {
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    notify(ctx, `Ignoring malformed Minecraft chat event: ${line}`, "warning");
+    return;
+  }
+  if (event.type !== "chat" || typeof event.message !== "string") return;
+
+  const username = event.username || "unknown";
+  const prompt = `Minecraft chat message from ${username}: ${event.message}`;
+  try {
+    if (ctx && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+    } else {
+      pi.sendUserMessage(prompt);
+    }
+  } catch (error) {
+    try {
+      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+    } catch (fallbackError) {
+      notify(
+        ctx,
+        `Failed to queue Minecraft chat message: ${fallbackError.message}`,
+        "error",
+      );
+    }
+  }
+}
 
 function getRuntimeDir(cwd) {
   return path.join(cwd, ".pi", "minecraft");

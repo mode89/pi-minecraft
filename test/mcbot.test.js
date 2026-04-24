@@ -42,14 +42,37 @@ test("wrong HTTP method/path return 404", async (t) => {
 
   assert.deepEqual(await request("GET", url), {
     status: 404,
-    body: "POST JS to /eval\n",
+    body: "POST JS to /eval or GET /listen\n",
   });
   assert.deepEqual(
     await request("POST", url.replace("/eval", "/wrong"), "print('x')"),
     {
     status: 404,
-    body: "POST JS to /eval\n",
+    body: "POST JS to /eval or GET /listen\n",
   });
+});
+
+test("/listen streams chat messages as NDJSON chunks", async (t) => {
+  const { bot, listenUrl } = await createFixture(t);
+  const controller = new AbortController();
+
+  const response = await fetch(listenUrl, { signal: controller.signal });
+  assert.equal(response.status, 200);
+  assert.match(
+    response.headers.get("content-type"),
+    /^application\/x-ndjson/,
+  );
+
+  const first = readNextLine(response.body.getReader());
+  bot.emit("chat", "Steve", "hello from chat");
+
+  const event = JSON.parse(await first);
+  assert.equal(event.type, "chat");
+  assert.equal(event.username, "Steve");
+  assert.equal(event.message, "hello from chat");
+  assert.match(event.timestamp, /^\d{4}-\d{2}-\d{2}T/);
+
+  controller.abort();
 });
 
 test("empty and unicode bodies are handled", async (t) => {
@@ -365,7 +388,12 @@ async function createFixture(t, config = {}) {
   t.after(() => new Promise((resolve) => server.close(resolve)));
 
   const { port } = server.address();
-  return { bot, server, url: `http://127.0.0.1:${port}/eval` };
+  return {
+    bot,
+    server,
+    url: `http://127.0.0.1:${port}/eval`,
+    listenUrl: `http://127.0.0.1:${port}/listen`,
+  };
 }
 
 function createFakeBot() {
@@ -464,6 +492,18 @@ function abandonPost(url, body, destroyAfterMs) {
     req.end(body);
     setTimeout(() => req.destroy(), destroyAfterMs);
   });
+}
+
+async function readNextLine(reader) {
+  const decoder = new TextDecoder();
+  let buffered = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error("stream ended before a line arrived");
+    buffered += decoder.decode(value, { stream: true });
+    const newline = buffered.indexOf("\n");
+    if (newline >= 0) return buffered.slice(0, newline);
+  }
 }
 
 function delay(ms) {
