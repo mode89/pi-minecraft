@@ -217,7 +217,21 @@ function handleListen(clients, _req, res) {
   });
   if (typeof res.flushHeaders === "function") res.flushHeaders();
   clients.add(res);
-  res.on("close", () => clients.delete(res));
+
+  // Keep-alive heartbeat. Node's fetch (undici) terminates the response body
+  // with `TypeError: terminated` after ~5 minutes of idle bytes. Write a bare
+  // newline every 15s so the stream never looks idle. Clients split on \n
+  // and skip empty lines, so this is invisible to them.
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write("\n");
+  }, 15000);
+  if (typeof heartbeat.unref === "function") heartbeat.unref();
+
+  res.on("close", () => {
+    clearInterval(heartbeat);
+    clients.delete(res);
+  });
 }
 
 function broadcastJsonLine(clients, event) {

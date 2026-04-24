@@ -215,11 +215,43 @@ function ensureChatListener(pi, ctx, current, hostPort) {
 
   const controller = new AbortController();
   const listener = { hostPort, controller };
-  runChatListener(pi, ctx, hostPort, controller.signal).catch((error) => {
-    if (controller.signal.aborted) return;
-    notify(ctx, `Minecraft chat listener stopped: ${error.message}`, "error");
-  });
+  runChatListenerWithReconnect(pi, ctx, hostPort, controller.signal);
   return listener;
+}
+
+async function runChatListenerWithReconnect(pi, ctx, hostPort, signal) {
+  // Node's fetch (undici) drops idle response bodies after ~5 minutes with
+  // `TypeError: terminated`. mcbot now sends a heartbeat, but also reconnect
+  // defensively on any non-abort failure so a blip doesn't silently stop chat.
+  let attempt = 0;
+  while (!signal.aborted) {
+    try {
+      await runChatListener(pi, ctx, hostPort, signal);
+      attempt = 0;
+    } catch (error) {
+      if (signal.aborted) return;
+      const delay = Math.min(30000, 500 * 2 ** attempt++);
+      notify(
+        ctx,
+        `Minecraft chat listener disconnected (${error.message}); `
+          + `reconnecting in ${Math.round(delay / 1000)}s`,
+        "warning",
+      );
+      await sleep(delay, signal);
+    }
+  }
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    }
+  });
 }
 
 function stopChatListener(listener) {
