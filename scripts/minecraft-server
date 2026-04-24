@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+WORKDIR="${PWD}/.minecraft-server"
+mkdir -p "${WORKDIR}"
+cd "${WORKDIR}"
+minecraft-server "$@"
