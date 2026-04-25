@@ -1,195 +1,244 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { parseArgs } = require("node:util");
+
+const DEFAULT_HTTP = "localhost:3000";
+const MCBOT_ARG_OPTIONS = {
+  server: { type: "string" },
+  user: { type: "string" },
+  http: { type: "string" },
+  timeout: { type: "string" },
+  help: { type: "boolean", short: "h" },
+};
 
 module.exports = function minecraftExtension(pi) {
-  const packageRoot = path.resolve(__dirname, "..");
-  const botScript = path.join(packageRoot, "mcbot.js");
-  const systemPromptPath = path.join(packageRoot, "system.md");
-  let chatListener = null;
+  const paths = getPackagePaths();
+  const extensionState = { chatListener: null };
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    stopChatListener(chatListener);
-    chatListener = null;
-    if (ctx && ctx.cwd) await stopManagedBot(ctx.cwd, botScript);
+    stopCurrentChatListener(extensionState);
+    if (ctx && ctx.cwd) await stopManagedBot(ctx.cwd, paths.botScript);
   });
 
-  pi.on("before_agent_start", async (event, ctx) => {
-    const state = await readStateIfExists(ctx.cwd);
-    if (!state) return;
-    if (!isManagedProcess(state.pid, botScript)) {
-      clearState(ctx.cwd);
-      return;
-    }
-
-    const systemPrompt = await fs.promises.readFile(systemPromptPath, "utf8");
-    const http = state.http || "localhost:3000";
-    const runtimeContext = [
-      "# Active Minecraft Bot Runtime",
-      "",
-      `- HTTP endpoint: http://${http}/eval`,
-      `- PID: ${state.pid}`,
-      `- Log: ${relative(ctx.cwd, state.logPath || getLogPath(ctx.cwd))}`,
-    ].join("\n");
-
-    return {
-      systemPrompt: [
-        event.systemPrompt,
-        systemPrompt,
-        runtimeContext,
-      ].join("\n\n"),
-    };
-  });
+  pi.on("before_agent_start", (event, ctx) => (
+    injectMinecraftPrompt(event, ctx, paths)
+  ));
 
   pi.registerCommand("minecraft:start", {
     description: "Start the Mineflayer mcbot background process",
-    handler: async (args, ctx) => {
-      const state = await readState(ctx.cwd);
-      if (state && isManagedProcess(state.pid, botScript)) {
-        chatListener = ensureChatListener(
-          pi,
-          ctx,
-          chatListener,
-          state.http || "localhost:3000",
-        );
-        notify(
-          ctx,
-          `mcbot already running: pid ${state.pid}; listening for chat`,
-          "info",
-        );
-        return;
-      }
-
-      const runtimeDir = ensureRuntimeDir(ctx.cwd);
-      const logPath = path.join(runtimeDir, "mcbot.log");
-      const out = fs.openSync(logPath, "a");
-      const err = fs.openSync(logPath, "a");
-      const botArgs = parseShellArgs(args || "");
-      const child = spawn(process.execPath, [botScript, ...botArgs], {
-        cwd: ctx.cwd,
-        detached: true,
-        stdio: ["ignore", out, err],
-        env: process.env,
-      });
-
-      child.unref();
-      fs.closeSync(out);
-      fs.closeSync(err);
-
-      const nextState = {
-        pid: child.pid,
-        startedAt: new Date().toISOString(),
-        cwd: ctx.cwd,
-        command: [process.execPath, botScript, ...botArgs],
-        http: getHttpAddress(botArgs),
-        logPath,
-      };
-      writeState(ctx.cwd, nextState);
-
-      const probe = await waitForEvalReady(
-        nextState.http,
-        child.pid,
-        botScript,
-        10000,
-      );
-      if (probe.status === "ready") {
-        chatListener = ensureChatListener(pi, ctx, chatListener, nextState.http);
-        notify(
-          ctx,
-          `started mcbot: pid ${child.pid}; /eval is ready; `
-            + `listening for Minecraft chat; bot instructions will be `
-            + `injected into future prompts; log ${relative(ctx.cwd, logPath)}`,
-          "success",
-        );
-        return;
-      }
-
-      if (probe.status === "exited") {
-        clearState(ctx.cwd);
-        notify(
-          ctx,
-          `mcbot exited before /eval became ready; `
-            + `log ${relative(ctx.cwd, logPath)}`,
-          "error",
-        );
-        return;
-      }
-
-      notify(
-        ctx,
-        `started mcbot: pid ${child.pid}, but /eval did not become `
-          + `ready within 10 seconds; Minecraft bot instructions will be `
-          + `injected into future prompts; log ${relative(ctx.cwd, logPath)}`,
-        "warning",
-      );
-    },
+    handler: (args, ctx) => startMinecraft(
+      pi,
+      ctx,
+      args,
+      extensionState,
+      paths,
+    ),
   });
 
   pi.registerCommand("minecraft:stop", {
     description: "Stop the background mcbot process",
-    handler: async (_args, ctx) => {
-      const state = await readState(ctx.cwd);
-      if (!state || !isManagedProcess(state.pid, botScript)) {
-        clearState(ctx.cwd);
-        notify(ctx, "mcbot is not running", "info");
-        return;
-      }
-
-      stopChatListener(chatListener);
-      chatListener = null;
-      await stopManagedBot(ctx.cwd, botScript);
-      notify(
-        ctx,
-        `stopped mcbot: pid ${state.pid}; Minecraft bot instructions disabled`,
-        "success",
-      );
-    },
+    handler: (_args, ctx) => stopMinecraft(ctx, extensionState, paths),
   });
 
   pi.registerCommand("minecraft:status", {
     description: "Show background mcbot process status",
-    handler: async (_args, ctx) => {
-      const state = await readState(ctx.cwd);
-      if (!state) {
-        notify(ctx, "mcbot status: not running", "info");
-        return;
-      }
-
-      const running = isManagedProcess(state.pid, botScript);
-      if (!running) {
-        clearState(ctx.cwd);
-        notify(
-          ctx,
-          `mcbot status: stale pid ${state.pid}; cleaned state`,
-          "warning",
-        );
-        return;
-      }
-
-      const http = state.http || "localhost:3000";
-      const reachable = await isHttpReachable(http);
-      const listening = chatListener && chatListener.hostPort === http;
-      const lines = [
-        `mcbot status: running`,
-        `pid: ${state.pid}`,
-        `started: ${state.startedAt || "unknown"}`,
-        `http: http://${http}/eval `
-          + `(${reachable ? "reachable" : "not reachable yet"})`,
-        `chat listener: ${listening ? "connected" : "not connected"}`,
-        `log: ${relative(ctx.cwd, state.logPath || getLogPath(ctx.cwd))}`,
-      ];
-      notify(ctx, lines.join("\n"), reachable ? "success" : "warning");
-    },
+    handler: (_args, ctx) => showMinecraftStatus(ctx, extensionState, paths),
   });
 };
 
-async function stopManagedBot(cwd, botScript) {
-  const state = await readState(cwd);
-  if (!state) return { status: "not-running" };
-  if (!isManagedProcess(state.pid, botScript)) {
-    clearState(cwd);
-    return { status: "stale", pid: state.pid };
+function getPackagePaths() {
+  const packageRoot = path.resolve(__dirname, "..");
+  return {
+    botScript: path.join(packageRoot, "mcbot.js"),
+    systemPromptPath: path.join(packageRoot, "system.md"),
+  };
+}
+
+async function injectMinecraftPrompt(event, ctx, paths) {
+  if (!ctx || !ctx.cwd) return undefined;
+
+  const state = await readManagedState(ctx.cwd, paths.botScript);
+  if (!state) return undefined;
+
+  const systemPrompt = await fs.promises.readFile(
+    paths.systemPromptPath,
+    "utf8",
+  );
+  return {
+    systemPrompt: [
+      event.systemPrompt,
+      systemPrompt,
+      formatRuntimeContext(ctx.cwd, state),
+    ].join("\n\n"),
+  };
+}
+
+async function startMinecraft(pi, ctx, args, extensionState, paths) {
+  const existing = await readManagedState(ctx.cwd, paths.botScript);
+  if (existing) {
+    startChatListener(pi, ctx, extensionState, existing.http);
+    notify(
+      ctx,
+      `mcbot already running: pid ${existing.pid}; listening for chat`,
+      "info",
+    );
+    return;
   }
+
+  let parsedArgs;
+  try {
+    parsedArgs = parseMcbotArgs(args || "");
+  } catch (error) {
+    notify(ctx, `invalid mcbot args: ${error.message}`, "error");
+    return;
+  }
+
+  const { argv: botArgs, http } = parsedArgs;
+  const { child, logPath } = spawnManagedBot(ctx.cwd, paths.botScript, botArgs);
+  const state = {
+    pid: child.pid,
+    startedAt: new Date().toISOString(),
+    cwd: ctx.cwd,
+    command: [process.execPath, paths.botScript, ...botArgs],
+    http,
+    logPath,
+  };
+  writeState(ctx.cwd, state);
+
+  const probe = await waitForEvalReady(
+    state.http,
+    child.pid,
+    paths.botScript,
+    10000,
+  );
+
+  if (probe.status === "ready") {
+    startChatListener(pi, ctx, extensionState, state.http);
+    notify(
+      ctx,
+      `started mcbot: pid ${child.pid}; /eval is ready; `
+        + `listening for Minecraft chat; bot instructions will be `
+        + `injected into future prompts; log ${relative(ctx.cwd, logPath)}`,
+      "success",
+    );
+    return;
+  }
+
+  if (probe.status === "exited") {
+    clearState(ctx.cwd);
+    notify(
+      ctx,
+      `mcbot exited before /eval became ready; `
+        + `log ${relative(ctx.cwd, logPath)}`,
+      "error",
+    );
+    return;
+  }
+
+  notify(
+    ctx,
+    `started mcbot: pid ${child.pid}, but /eval did not become `
+      + `ready within 10 seconds; Minecraft bot instructions will be `
+      + `injected into future prompts; log ${relative(ctx.cwd, logPath)}`,
+    "warning",
+  );
+}
+
+async function stopMinecraft(ctx, extensionState, paths) {
+  const state = await readManagedState(ctx.cwd, paths.botScript);
+  if (!state) {
+    clearState(ctx.cwd);
+    notify(ctx, "mcbot is not running", "info");
+    return;
+  }
+
+  stopCurrentChatListener(extensionState);
+  await stopManagedBot(ctx.cwd, paths.botScript);
+  notify(
+    ctx,
+    `stopped mcbot: pid ${state.pid}; Minecraft bot instructions disabled`,
+    "success",
+  );
+}
+
+async function showMinecraftStatus(ctx, extensionState, paths) {
+  const state = await readStateIfExists(ctx.cwd);
+  if (!state) {
+    notify(ctx, "mcbot status: not running", "info");
+    return;
+  }
+
+  if (!isManagedProcess(state.pid, paths.botScript)) {
+    clearState(ctx.cwd);
+    notify(
+      ctx,
+      `mcbot status: stale pid ${state.pid}; cleaned state`,
+      "warning",
+    );
+    return;
+  }
+
+  const reachable = await isHttpReachable(state.http);
+  const listening = extensionState.chatListener
+    && extensionState.chatListener.hostPort === state.http;
+  notify(
+    ctx,
+    [
+      "mcbot status: running",
+      `pid: ${state.pid}`,
+      `started: ${state.startedAt}`,
+      `http: http://${state.http}/eval `
+        + `(${reachable ? "reachable" : "not reachable yet"})`,
+      `chat listener: ${listening ? "connected" : "not connected"}`,
+      `log: ${relative(ctx.cwd, state.logPath)}`,
+    ].join("\n"),
+    reachable ? "success" : "warning",
+  );
+}
+
+function spawnManagedBot(cwd, botScript, botArgs) {
+  const runtimeDir = ensureRuntimeDir(cwd);
+  const logPath = path.join(runtimeDir, "mcbot.log");
+  const out = fs.openSync(logPath, "a");
+  const err = fs.openSync(logPath, "a");
+
+  try {
+    const child = spawn(process.execPath, [botScript, ...botArgs], {
+      cwd,
+      detached: true,
+      stdio: ["ignore", out, err],
+      env: process.env,
+    });
+    child.unref();
+    return { child, logPath };
+  } finally {
+    fs.closeSync(out);
+    fs.closeSync(err);
+  }
+}
+
+function formatRuntimeContext(cwd, state) {
+  return [
+    "# Active Minecraft Bot Runtime",
+    "",
+    `- HTTP endpoint: http://${state.http}/eval`,
+    `- PID: ${state.pid}`,
+    `- Log: ${relative(cwd, state.logPath)}`,
+  ].join("\n");
+}
+
+async function readManagedState(cwd, botScript) {
+  const state = await readStateIfExists(cwd);
+  if (!state) return null;
+  if (isManagedProcess(state.pid, botScript)) return state;
+  clearState(cwd);
+  return null;
+}
+
+async function stopManagedBot(cwd, botScript) {
+  const state = await readManagedState(cwd, botScript);
+  if (!state) return;
 
   signalProcess(state.pid, "SIGTERM");
   const stopped = await waitForExit(state.pid, 3000);
@@ -198,7 +247,6 @@ async function stopManagedBot(cwd, botScript) {
     await waitForExit(state.pid, 1000);
   }
   clearState(cwd);
-  return { status: "stopped", pid: state.pid };
 }
 
 function signalProcess(pid, signal) {
@@ -207,6 +255,20 @@ function signalProcess(pid, signal) {
   } catch (error) {
     if (!error || error.code !== "ESRCH") throw error;
   }
+}
+
+function startChatListener(pi, ctx, extensionState, hostPort) {
+  extensionState.chatListener = ensureChatListener(
+    pi,
+    ctx,
+    extensionState.chatListener,
+    hostPort || DEFAULT_HTTP,
+  );
+}
+
+function stopCurrentChatListener(extensionState) {
+  stopChatListener(extensionState.chatListener);
+  extensionState.chatListener = null;
 }
 
 function ensureChatListener(pi, ctx, current, hostPort) {
@@ -330,12 +392,6 @@ function getLogPath(cwd) {
   return path.join(getRuntimeDir(cwd), "mcbot.log");
 }
 
-async function readState(cwd) {
-  const state = await readStateIfExists(cwd);
-  if (state === null) return null;
-  return state;
-}
-
 async function readStateIfExists(cwd) {
   try {
     return JSON.parse(await fs.promises.readFile(getStatePath(cwd), "utf8"));
@@ -422,53 +478,18 @@ async function probeEval(hostPort) {
   }
 }
 
-function getHttpAddress(args) {
-  const idx = args.indexOf("--http");
-  if (idx >= 0 && args[idx + 1]) return args[idx + 1];
-  const eq = args.find((arg) => arg.startsWith("--http="));
-  if (eq) return eq.slice("--http=".length);
-  return "localhost:3000";
-}
-
-function parseShellArgs(input) {
-  const args = [];
-  let current = "";
-  let quote = null;
-  let escaping = false;
-
-  for (const ch of input) {
-    if (escaping) {
-      current += ch;
-      escaping = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escaping = true;
-      continue;
-    }
-    if (quote) {
-      if (ch === quote) quote = null;
-      else current += ch;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      continue;
-    }
-    if (/\s/.test(ch)) {
-      if (current) {
-        args.push(current);
-        current = "";
-      }
-      continue;
-    }
-    current += ch;
-  }
-
-  if (escaping) current += "\\";
-  if (quote) throw new Error(`unterminated ${quote} quote in arguments`);
-  if (current) args.push(current);
-  return args;
+function parseMcbotArgs(input) {
+  const trimmed = Array.isArray(input) ? null : input.trim();
+  const argv = Array.isArray(input)
+    ? input
+    : (trimmed ? trimmed.split(/\s+/) : []);
+  const { values } = parseArgs({
+    args: argv,
+    options: MCBOT_ARG_OPTIONS,
+    strict: true,
+    allowPositionals: false,
+  });
+  return { argv, http: values.http || DEFAULT_HTTP };
 }
 
 function relative(cwd, target) {
