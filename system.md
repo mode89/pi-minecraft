@@ -14,8 +14,9 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
   JS
   ```
 - Your code runs inside `async () => { <your code> }`.
-- In scope: `bot`, `goals`, `Vec3`, `print`, `sleep`, `withTimeout`,
-  `abort`.
+- In scope: `bot`, `snippets`, `goals`, `Vec3`, `print`, `sleep`,
+  `withTimeout`, `abort`. User snippets, when defined, are available as
+  `snippets.*`.
 - **Only `print(...)` output is returned.** Return values are discarded.
 - On error the server returns JSON `{error, stack, output, cleanupErrors}`
   with status 500. On per-request deadline, status 504 with the same shape
@@ -77,6 +78,54 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
   - Typical uses: resolving an id for `findBlock({matching: id})`, checking
     if an item is food, filtering entities by type, picking the right tool
     for a block.
+
+# User Snippets
+
+Users may define `.pi/minecraft/snippets.js` in the working directory.
+This file is a user-maintained library of small, reusable bot helpers. The
+runtime reloads it before every `/eval` and passes its CommonJS exports as
+`snippets`, so eval scripts can call helpers as `snippets.name(...)`.
+If the file does not exist, `snippets` is an empty object. If the file exists
+but cannot load, the eval fails and reports the load error.
+
+Example `.pi/minecraft/snippets.js`:
+```js
+exports.countItem = (bot, name) => bot.inventory
+    .items()
+    .filter((item) => item.name === name)
+    .reduce((total, item) => total + item.count, 0)
+
+exports.positionKey = (pos) => [
+    Math.floor(pos.x),
+    Math.floor(pos.y),
+    Math.floor(pos.z),
+].join(",")
+```
+
+Use snippets to remove repeated boilerplate, not to hide task-specific plans.
+Pass the current `bot`, `goals`, `Vec3`, or other eval-scope values explicitly
+when a helper needs them:
+```js
+const logs = snippets.countItem(bot, "oak_log")
+print("oak_log", logs, "at", snippets.positionKey(bot.entity.position))
+```
+
+Maintain snippets conservatively:
+- When you notice repeated eval boilerplate, a generally useful helper, or a
+  task that would be safer/clearer with a shared helper, proactively ask the
+  user whether to add or modify `.pi/minecraft/snippets.js`. Briefly state the
+  proposed helper name and what it would do.
+- Do not silently edit snippets during unrelated gameplay tasks; get user
+  confirmation first unless they explicitly asked you to maintain snippets.
+- Keep top-level code side-effect-free: define helpers only. Do not start
+  timers, register listeners, move the bot, chat, dig, or mutate inventory at
+  module load time.
+- Helpers that perform bot actions should be `async`, should `await` bot
+  operations, and should let eval cleanup/abort behavior work normally.
+- Keep helpers generic and documented enough that future eval scripts can use
+  them without guessing.
+- Prefer adding a snippet only after a pattern repeats; remove or simplify
+  stale helpers.
 
 # Workflow
 

@@ -8,8 +8,10 @@
 // Run with --help to print generated command-line usage.
 //
 // POST any JS source to http://<http>/eval and it will be evaluated in an
-// async function with `bot`, `goals`, `Vec3`, `print`, `sleep`, `withTimeout`,
-// and `abort` (an AbortSignal) in scope. Anything the script passes to
+// async function with `bot`, `snippets`, `goals`, `Vec3`, `print`, `sleep`,
+// `withTimeout`, and `abort` (an AbortSignal) in scope. Before each eval,
+// exports from .pi/minecraft/snippets.js in the current working directory are
+// reloaded and passed as `snippets`. Anything the script passes to
 // `print(...)` is collected and returned as the response body. The script's
 // own return value is ignored.
 //
@@ -29,6 +31,7 @@
 // is trusted; /eval intentionally executes arbitrary JavaScript.
 
 const http = require("http");
+const path = require("path");
 const mineflayer = require("mineflayer");
 const { pathfinder, Movements, goals } = require("mineflayer-pathfinder");
 const { loader: autoEat } = require("mineflayer-auto-eat");
@@ -379,6 +382,7 @@ function createEvalSession(runtime, req, res) {
 function buildEvalContext(session) {
   return {
     bot: createAbortGuardedProxy(session, session.bot),
+    snippets: loadSnippets(getSnippetsPath(session.config)),
     goals,
     Vec3,
     print: (...args) => session.output.push(util.format(...args)),
@@ -396,7 +400,8 @@ async function executeUserCode(context, code) {
   // instead of Node's process-wide timer globals.
   const body = `return (async () => { ${code} })();`;
   const fn = new Function(
-    "bot", "goals", "Vec3", "print", "sleep", "withTimeout", "abort",
+    "bot", "snippets", "goals", "Vec3", "print", "sleep", "withTimeout",
+    "abort",
     "setTimeout", "clearTimeout",
     "setInterval", "clearInterval",
     "setImmediate", "clearImmediate",
@@ -405,6 +410,7 @@ async function executeUserCode(context, code) {
 
   await fn(
     context.bot,
+    context.snippets,
     context.goals,
     context.Vec3,
     context.print,
@@ -481,6 +487,36 @@ function writeEvalResult(session, scriptError, cleanupErrors) {
     "text/plain",
     session.output.join("\n") + (session.output.length ? "\n" : ""),
   );
+}
+
+// Resolve the user snippets path. Tests may override this explicitly.
+function getSnippetsPath(config) {
+  const snippetsPath = config.snippetsPath
+    || path.join(process.cwd(), ".pi", "minecraft", "snippets.js");
+  return path.isAbsolute(snippetsPath)
+    ? snippetsPath
+    : path.resolve(process.cwd(), snippetsPath);
+}
+
+// Load all CommonJS exports from snippets.js, returning an empty object when
+// the optional file does not exist. Syntax/runtime errors in an existing file
+// are surfaced to the eval caller.
+function loadSnippets(snippetsPath) {
+  let resolved;
+  try {
+    resolved = require.resolve(snippetsPath);
+  } catch (error) {
+    if (error && error.code === "MODULE_NOT_FOUND") return {};
+    throw error;
+  }
+
+  delete require.cache[resolved];
+  const loaded = require(resolved);
+  if (loaded === null || loaded === undefined) return {};
+  if (typeof loaded !== "object" && typeof loaded !== "function") {
+    throw new TypeError(`${snippetsPath} must export an object or function`);
+  }
+  return loaded;
 }
 
 // ---------------------------------------------------------------------------

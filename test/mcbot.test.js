@@ -1,6 +1,9 @@
 const assert = require("node:assert/strict");
 const EventEmitter = require("node:events");
+const fs = require("node:fs/promises");
 const http = require("node:http");
+const os = require("node:os");
+const path = require("node:path");
 const test = require("node:test");
 
 const { createServer } = require("../mcbot.js");
@@ -108,6 +111,67 @@ test("empty and unicode bodies are handled", async (t) => {
   assert.deepEqual(await post(url, "print('unicode ☃ ok')"), {
     status: 200,
     body: "unicode ☃ ok\n",
+  });
+});
+
+test("user snippets are loaded fresh on each eval", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mcbot-snippets-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+
+  const snippetsPath = path.join(dir, "snippets.js");
+  await fs.writeFile(snippetsPath, "exports.answer = () => 1;\n");
+
+  const { url } = await createFixture(t, { snippetsPath });
+  const initial = await post(
+    url,
+    "print('answer', snippets.answer(), 'bot', typeof bot.snippets)",
+  );
+  assert.deepEqual(initial, {
+    status: 200,
+    body: "answer 1 bot undefined\n",
+  });
+
+  await fs.writeFile(
+    snippetsPath,
+    "exports.answer = () => 2;\nexports.label = 'fresh';\n",
+  );
+  const fresh = await post(
+    url,
+    "print('answer', snippets.answer(), snippets.label)",
+  );
+  assert.deepEqual(fresh, { status: 200, body: "answer 2 fresh\n" });
+});
+
+test("missing user snippets file provides empty snippets object", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mcbot-snippets-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+
+  const { url } = await createFixture(t, {
+    snippetsPath: path.join(dir, "missing.js"),
+  });
+
+  const response = await post(
+    url,
+    "print(typeof snippets, Object.keys(snippets).length)",
+  );
+  assert.deepEqual(response, { status: 200, body: "object 0\n" });
+});
+
+test("failing user snippets import reports a JSON eval error", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mcbot-snippets-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+
+  const snippetsPath = path.join(dir, "snippets.js");
+  await fs.writeFile(snippetsPath, "throw new Error('bad snippets')\n");
+
+  const { url } = await createFixture(t, { snippetsPath });
+  const response = await post(url, "print('not reached')");
+
+  assert.equal(response.status, 500);
+  assertJsonSubset(response.body, {
+    error: "bad snippets",
+    output: "",
+    cleanupErrors: [],
   });
 });
 
@@ -470,6 +534,7 @@ async function createFixture(t, config = {}) {
   const bot = createFakeBot();
   const server = createServer(bot, {
     defaultTimeoutMs: config.defaultTimeoutMs ?? 500,
+    snippetsPath: config.snippetsPath,
   });
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
