@@ -22,14 +22,15 @@ const DIAGONAL_COST = Math.SQRT2;
 //     from a candidate block to the target. Any block whose distance is
 //     <= 0.5 is treated as arrived.
 //
-// Resolves with `undefined` on arrival.
+// Resolves with `undefined` on arrival, or early when the `stopWhen`
+// predicate (checked at entry, between waypoints, and each tick) returns
+// true.
 //
 // Throws:
 //   GotoError       failure to reach the goal:
 //                     status "unreachable" — A* drained the open set
 //                     status "limit"       — A* hit the maxNodes budget
 //                     status "stuck"       — walker stalled mid-route
-//   AbortError      the signal aborted (rejects with the signal's reason)
 //   TypeError       programmer error (bad bot or goal arguments)
 async function goto(bot, goal, options = {}) {
   if (!bot || !bot.entity || !bot.entity.position) {
@@ -37,11 +38,11 @@ async function goto(bot, goal, options = {}) {
   }
   const distanceTo = toDistanceFn(goal);
 
-  const { signal, maxNodes = 10000 } = options;
-  signal?.throwIfAborted();
+  const { maxNodes = 10000, stopWhen = () => false } = options;
+  if (stopWhen()) return;
 
   const start = floorPos(bot.entity.position);
-  const plan = planPath(bot, start, distanceTo, { maxNodes, signal });
+  const plan = planPath(bot, start, distanceTo, { maxNodes });
 
   if (plan.status === "limit" || plan.status === "exhausted") {
     const status = plan.status === "limit" ? "limit" : "unreachable";
@@ -53,7 +54,7 @@ async function goto(bot, goal, options = {}) {
   }
 
   try {
-    await walkPath(bot, plan.path, { signal });
+    await walkPath(bot, plan.path, { stopWhen });
   } catch (error) {
     // walkPath throws a bare GotoError({status: "stuck"}); enrich it here
     // where we have the bot's live position and the distance function.
@@ -89,73 +90,47 @@ class GotoError extends Error {
   }
 }
 
-// Follow a moving target until the signal aborts. `target` is either:
+// Follow a moving target. `target` is either:
 //   - an entity (any object with a `.position` Vec3); the bot stays within
 //     `range` blocks of it (default 5).
 //   - a `(pos) => distance` function (same form as goto's distance-function
 //     goal); bake any stand-off distance into the function. `range` is
 //     ignored in this case.
 //
-// Replans every `max(currentDistance / 20, 1)` seconds: cheap when far away,
-// responsive when close. Retries silently on stuck/unreachable/limit (the
-// target may move into reach). Throws AbortError when `signal` aborts; all
-// other errors (TypeError, programmer bugs) propagate.
+// Loops until `stopWhen` returns true (default: forever). Each iteration
+// walks toward the current target, interrupting goto every replan interval
+// (scaled by distance). Retries silently on stuck/unreachable/limit.
 async function follow(bot, target, options = {}) {
-  const { range = 5, signal } = options;
+  const { range = 5, stopWhen = () => false } = options;
   const distanceFn = typeof target === "function"
     ? target
     : (pos) => target.position.distanceTo(pos) - range;
 
-  // Sentinel reason used to distinguish our own replan-cancel from an
-  // external abort propagating through the inner signal.
-  const REPLAN = Symbol("follow.replan");
-
-  while (true) {
-    signal?.throwIfAborted();
-
+  while (!stopWhen()) {
     const here = floorPos(bot.entity.position);
     const dist = Math.max(0, distanceFn(here));
-    const replanMs = Math.max(dist / 20, 1) * 1000;
-
-    const inner = new AbortController();
-    const forwardAbort = () => inner.abort(signal.reason);
-    signal?.addEventListener("abort", forwardAbort);
-    const timer = setTimeout(() => inner.abort(REPLAN), replanMs);
+    // 50ms per tick. Replan interval scales with distance (min 1s = 20 ticks).
+    const replanMs = Math.max(Math.ceil(dist), 20) * 50;
+    const deadline = Date.now() + replanMs;
+    const stopOrReplan = () => stopWhen() || Date.now() >= deadline;
 
     try {
-      await goto(bot, distanceFn, { signal: inner.signal });
-      // In range; idle until the next replan tick before re-checking.
-      await abortableSleep(replanMs, signal);
+      await goto(bot, distanceFn, { stopWhen: stopOrReplan });
     } catch (error) {
-      if (error === REPLAN) continue;       // our own cancel, replan now
-      if (error instanceof GotoError) {     // stuck/unreachable/limit
-        await abortableSleep(replanMs, signal);
-        continue;
-      }
-      throw error;                          // AbortError, TypeError, bugs
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", forwardAbort);
+      if (!(error instanceof GotoError)) throw error;
+      // stuck/unreachable/limit: target may move into reach later.
+    }
+    // Idle until the deadline; on deadline-triggered replan this is already
+    // true and we re-plan immediately.
+    while (!stopOrReplan()) {
+      await bot.waitForTicks(1);
     }
   }
 }
 
-// Promise-based setTimeout that rejects with the signal's reason on abort.
-function abortableSleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(signal.reason);
-    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
 // Plan a path from a start block to a goal via astar. `goal` may be an
 // `{x, y, z}` point or a `(pos) => distance` function (see `goto`).
-function planPath(bot, start, goal, { maxNodes, signal } = {}) {
+function planPath(bot, start, goal, { maxNodes } = {}) {
   const distanceTo = toDistanceFn(goal);
   return astar({
     start,
@@ -166,7 +141,6 @@ function planPath(bot, start, goal, { maxNodes, signal } = {}) {
     heuristic: (n) => Math.max(0, distanceTo(n) - 0.5),
     key: positionKey,
     maxNodes,
-    signal,
   });
 }
 
@@ -189,23 +163,25 @@ function toDistanceFn(goal) {
 
 // Drive the bot through a list of standing positions in order. Throws a
 // GotoError({status: "stuck"}) if the bot stalls; otherwise returns once
-// the final waypoint is reached.
-async function walkPath(bot, path, { signal } = {}) {
+// the final waypoint is reached or `stopWhen` becomes true.
+async function walkPath(bot, path, { stopWhen = () => false } = {}) {
   for (let i = 1; i < path.length; i++) {
-    await walkToWaypoint(bot, path[i], { signal });
+    if (stopWhen()) return;
+    await walkToWaypoint(bot, path[i], { stopWhen });
   }
 }
 
 // Drive the bot to a single standing position, ticking until arrival.
-// Throws a GotoError({status: "stuck"}) if the waypoint becomes unstandable
-// or the bot makes no progress for `stuckLimit` ticks.
-async function walkToWaypoint(bot, target, { signal } = {}) {
+// Returns early when `stopWhen` becomes true. Throws a
+// GotoError({status: "stuck"}) if the waypoint becomes unstandable or the
+// bot makes no progress for `stuckLimit` ticks.
+async function walkToWaypoint(bot, target, { stopWhen = () => false } = {}) {
   const stuckLimit = 40;
   let bestDistance = Infinity;
   let stuckTicks = 0;
 
   while (true) {
-    signal?.throwIfAborted();
+    if (stopWhen()) return;
 
     // Re-validate the waypoint each tick so we notice world changes.
     if (!isStandable(bot, target.x, target.y, target.z)) {
@@ -374,7 +350,6 @@ function clearMovementControls(bot) {
 //   key:      (node) => string|number   identity by default; used to dedupe
 //                                       nodes whose values are not primitive
 //   maxNodes: number                    expansion budget (default 10000)
-//   signal:   AbortSignal               cooperative cancellation
 //
 // Returns { status, path, cost, stats, closest? } where status is one of:
 //   "found"      goal reached; path is [start, ..., goal], cost is total g
@@ -383,9 +358,8 @@ function clearMovementControls(bot) {
 // For non-"found" results, `closest` is the expanded node with the smallest
 // heuristic value (i.e. the best lower bound on "how close we got").
 //
-// Throws the signal's abort reason if the signal aborts before a goal is
-// reached. Negative edge costs and inadmissible heuristics are caller
-// contract violations: A* will return a path but it may not be optimal.
+// Negative edge costs and inadmissible heuristics are caller contract
+// violations: A* will return a path but it may not be optimal.
 function astar(options) {
   const {
     start,
@@ -394,18 +368,15 @@ function astar(options) {
     heuristic,
     key = (node) => node,
     maxNodes = 10000,
-    signal,
   } = options;
 
   const state = createSearchState(start, key, heuristic);
 
-  signal?.throwIfAborted();
   if (isGoal(start)) {
     return formatResult("found", state, state.startKey);
   }
 
   while (state.open.size > 0) {
-    signal?.throwIfAborted();
     if (state.stats.expanded >= maxNodes) {
       return formatResult("limit", state, null);
     }

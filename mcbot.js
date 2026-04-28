@@ -590,8 +590,8 @@ function createBotFacade(bot, session) {
   // trivial pass-throughs are populated from the lists below.
   const facade = {
     setControlState(state, value) {
-      guard();
       if (value) {
+        guard();
         cleanup.deferOnce(
           `control:${state}`,
           () => bot.setControlState(state, false),
@@ -619,17 +619,15 @@ function createBotFacade(bot, session) {
       return bot.activateItem(...args);
     },
     goto(goal, options) {
-      const merged = { ...(options || {}), signal };
       return racedAwait(
-        (g, o) => pathfinder.goto(bot, g, o),
-        [goal, merged],
+        (g, o) => pathfinder.goto(facade, g, o),
+        [goal, options || {}],
       );
     },
     follow(target, options) {
-      const merged = { ...(options || {}), signal };
       return racedAwait(
-        (t, o) => pathfinder.follow(bot, t, o),
-        [target, merged],
+        (t, o) => pathfinder.follow(facade, t, o),
+        [target, options || {}],
       );
     },
 
@@ -700,7 +698,7 @@ function createBotFacade(bot, session) {
 
   // Abort-aware awaitables.
   for (const name of [
-    "lookAt", "waitForTicks", "waitForChunksToLoad", "placeBlock",
+    "lookAt", "look", "waitForTicks", "waitForChunksToLoad", "placeBlock",
     "activateBlock", "equip", "tossStack", "consume", "craft", "transfer",
     "sleep", "wake",
   ]) {

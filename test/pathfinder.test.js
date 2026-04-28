@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const {
-  createMinHeap, astar, planPath, goto, GotoError,
+  createMinHeap, astar, planPath, goto, follow, GotoError,
 } = require("../pathfinder.js");
 const { createFakeBot, simulate } = require("./fake-bot.js");
 
@@ -253,19 +253,6 @@ test("astar reports limit when maxNodes is exceeded", () => {
   assert.equal(result.status, "limit");
   assert.equal(result.path, null);
   assert.equal(result.stats.expanded, 3);
-});
-
-test("astar throws the abort reason when the signal is already aborted", () => {
-  const controller = new AbortController();
-  controller.abort();
-
-  assert.throws(() => astar({
-    start: "A",
-    isGoal: (node) => node === "Z",
-    neighbors: () => [{ node: "B", cost: 1 }],
-    heuristic: () => 0,
-    signal: controller.signal,
-  }), controller.signal.reason);
 });
 
 test("astar uses key() so non-primitive nodes are deduped by value", () => {
@@ -560,15 +547,38 @@ test("goto throws GotoError(limit) when maxNodes is exceeded", async () => {
   );
 });
 
-test("goto rejects with the abort reason when signal is pre-aborted", async () => {
+test("goto returns cleanly when stopWhen is true at entry", async () => {
   const bot = createFakeBot(flatMap(5, 5));
-  const controller = new AbortController();
-  controller.abort();
+  const result = await simulate(bot, goto(bot, { x: 4, y: 1, z: 0 }, {
+    stopWhen: () => true,
+  }));
 
-  await assert.rejects(
-    goto(bot, { x: 4, y: 1, z: 0 }, { signal: controller.signal }),
-    controller.signal.reason,
-  );
+  assert.equal(result, undefined);
+  // Bot did not move from spawn.
+  assert.equal(bot.entity.position.x, 0.5);
+  assert.equal(bot.entity.position.z, 0.5);
+});
+
+test("goto returns cleanly when stopWhen becomes true mid-walk", async () => {
+  const bot = createFakeBot(flatMap(10, 5));
+  const result = await simulate(bot, goto(bot, { x: 9, y: 1, z: 0 }, {
+    stopWhen: () => bot.entity.position.x > 3,
+  }));
+
+  assert.equal(result, undefined);
+  // Bot stopped between the trigger point and the goal.
+  assert.ok(bot.entity.position.x > 3);
+  assert.ok(bot.entity.position.x < 9);
+  // All movement controls released.
+  assert.equal(bot.controlState.forward, false);
+  assert.equal(bot.controlState.jump, false);
+});
+
+test("follow returns when stopWhen is true at entry", async () => {
+  const bot = createFakeBot(flatMap(5, 5));
+  const distanceFn = (pos) => Math.hypot(pos.x - 4, pos.z);
+  await simulate(bot, follow(bot, distanceFn, { stopWhen: () => true }));
+
   // Bot did not move from spawn.
   assert.equal(bot.entity.position.x, 0.5);
   assert.equal(bot.entity.position.z, 0.5);
