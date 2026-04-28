@@ -353,8 +353,18 @@ function sendChatTurn(pi, ctx, line) {
   }
   if (event.type !== "chat" || typeof event.message !== "string") return;
 
+  let message = event.message;
+  if (message.startsWith("!")) {
+    if (ctx && typeof ctx.abort === "function"
+      && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+      ctx.abort();
+    }
+    message = message.slice(1);
+    if (message.trim() === "") return;
+  }
+
   const username = event.username || "unknown";
-  const prompt = `Minecraft chat message from ${username}: ${event.message}`;
+  const prompt = `Minecraft chat message from ${username}: ${message}`;
   try {
     if (ctx && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
       pi.sendUserMessage(prompt, { deliverAs: "followUp" });
