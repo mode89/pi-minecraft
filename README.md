@@ -1,39 +1,10 @@
 # pi-minecraft
 
-Interactive Pi-powered Minecraft bot.
+AI-powered Minecraft bot for Pi.
 
-This Pi package adds Minecraft control commands to Pi:
+This package adds Pi commands that manage a background Mineflayer runtime (`mcbot.js`) and inject Minecraft bot-operator instructions (`system.md`) while the runtime is active. Pi then controls the bot through the runtime's local HTTP API.
 
-- `/minecraft:start` starts the bot runtime in the background and enables Minecraft operator instructions for future prompts.
-- `/minecraft:status` reports whether the background bot is running and reachable.
-- `/minecraft:stop` stops the background bot and disables the Minecraft operator instructions.
-
-## Local development
-
-```sh
-npm install
-npm test
-```
-
-Start an ad-hoc local Minecraft server, if needed:
-
-```sh
-./scripts/minecraft-server
-```
-
-Implementation files:
-
-- `extensions/pi-minecraft.js`: Pi extension entry point.
-- `mcbot.js`: managed bot runtime with an HTTP `/eval` control endpoint.
-- `system.md`: operator instructions injected while the managed bot is running.
-
-For debugging, start the runtime manually:
-
-```sh
-node mcbot.js --server localhost:25565 --http localhost:3000
-```
-
-## Pi package usage
+## Usage
 
 Install this repository as a Pi package:
 
@@ -51,13 +22,12 @@ Commands:
 /minecraft:stop
 ```
 
-After `/minecraft:start`, normal prompts can directly ask the bot to act in Minecraft while the background runtime is running.
+Once the runtime is started, you can operate the bot either through Pi chat or through normal Minecraft chat. Minecraft chat messages from other players are forwarded into Pi as user messages.
 
-Examples:
+Example:
 
 ```text
 /minecraft:start --server localhost:25565 --http localhost:3000
-/minecraft:status
 collect some wood
 /minecraft:stop
 ```
@@ -66,7 +36,7 @@ The background process writes state and logs under `.pi/minecraft/` in the curre
 
 ## User snippets
 
-Users may define `.pi/minecraft/snippets.js` as a local CommonJS helper library for reusable bot code. The bot runtime reloads this file before each `/eval` request and exposes its exports to eval scripts as `snippets`.
+Users may define `.pi/minecraft/snippets.js` as a local CommonJS helper library for reusable bot code. The runtime reloads this file before each `/eval` request and exposes its exports to eval scripts as `snippets`.
 
 Example:
 
@@ -86,6 +56,12 @@ print("oak_log", snippets.countItem(bot, "oak_log"))
 
 If the file is missing, `snippets` is an empty object. If it exists but fails to load, the eval request fails with the import error. Keep snippet module load side-effect-free; define helpers only, and pass `bot` or other eval-scope values into helpers explicitly.
 
+## Development
+
+```sh
+node --test
+```
+
 ## Security
 
-The managed bot runtime executes arbitrary JavaScript received by HTTP. Keep `--http` bound to localhost unless you fully trust the network. Game/world changes made by scripts are real and are not rolled back.
+The managed bot runtime executes arbitrary JavaScript received over HTTP. Keep `--http` bound to localhost unless you fully trust the network. Game/world changes made by scripts are real and are not rolled back.
