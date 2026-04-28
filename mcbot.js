@@ -8,7 +8,7 @@
 // Run with --help to print generated command-line usage.
 //
 // POST any JS source to http://<http>/eval and it will be evaluated in an
-// async function with `bot`, `snippets`, `goals`, `Vec3`, `print`, `sleep`,
+// async function with `bot`, `snippets`, `Vec3`, `print`, `sleep`,
 // `withTimeout`, and `abort` (an AbortSignal) in scope. Before each eval,
 // exports from .pi/minecraft/snippets.js in the current working directory are
 // reloaded and passed as `snippets`. Anything the script passes to
@@ -18,8 +18,8 @@
 // Eval requests are serialized: one bot control script runs at a time.
 //
 // Each request is hermetic: behavior/intent state the script introduces
-// (control states, pathfinder goals, pvp targets, listeners it adds, timers it
-// schedules, open windows, activated items) is rolled back when the script
+// (control states, listeners it adds, timers it schedules, open windows,
+// activated items, in-flight `bot.goto` calls) is rolled back when the script
 // settles, when the client disconnects, or when the deadline expires.
 // Game/world state (position, health, inventory, broken/placed blocks) is
 // never touched.
@@ -33,11 +33,10 @@
 const http = require("http");
 const path = require("path");
 const mineflayer = require("mineflayer");
-const { pathfinder, Movements, goals } = require("mineflayer-pathfinder");
 const { loader: autoEat } = require("mineflayer-auto-eat");
-const { plugin: pvp } = require("mineflayer-pvp");
 const hawkEye = require("minecrafthawkeye").default;
 const Vec3 = require("vec3").Vec3;
+const pathfinder = require("./pathfinder.js");
 const util = require("util");
 
 // ---------------------------------------------------------------------------
@@ -214,20 +213,19 @@ function createMinecraftBot(config) {
   return bot;
 }
 
-// Attach Mineflayer plugins and one-time plugin setup hooks.
+// Attach Mineflayer plugins, our own pathfinder, and one-time setup hooks.
 function installBotPlugins(bot) {
-  bot.loadPlugin(pathfinder);
   bot.loadPlugin(autoEat);
-  bot.loadPlugin(pvp);
   bot.loadPlugin(hawkEye);
 
   // Eval scripts may temporarily install many listeners. They are removed by
   // request cleanup, so the EventEmitter default of 10 only creates noise.
   bot.setMaxListeners(200);
 
-  bot.once("spawn", () => {
-    bot.pathfinder.setMovements(new Movements(bot));
-  });
+  // Expose our A*-driven walker as a normal bot method. Per-request abort is
+  // wired in by patchBotGoto; callers just `await bot.goto(goal)`.
+  bot.goto = (goal, options) => pathfinder.goto(bot, goal, options);
+  bot.follow = (target, options) => pathfinder.follow(bot, target, options);
 }
 
 // Register process-level logging for bot lifecycle events.
@@ -327,7 +325,7 @@ async function runEvalSession(runtime, req, res, code) {
   try {
     installRequestPatches(session);
     await raceAbort(
-      session.signal,
+      session.deadline.signal,
       executeUserCode(buildEvalContext(session), code),
       null,
     );
@@ -345,11 +343,11 @@ function createEvalSession(runtime, req, res) {
   const controller = new AbortController();
   const { signal } = controller;
   const output = [];
-  const deadline = setTimeout(() => {
+  const timeoutId = setTimeout(() => {
     if (!signal.aborted) controller.abort(makeAbortError("deadline"));
   }, runtime.config.defaultTimeoutMs);
 
-  if (typeof deadline.unref === "function") deadline.unref();
+  if (typeof timeoutId.unref === "function") timeoutId.unref();
 
   const onClose = () => {
     if (!res.writableEnded && !signal.aborted) {
@@ -366,9 +364,7 @@ function createEvalSession(runtime, req, res) {
     config: runtime.config,
     req,
     res,
-    controller,
-    signal,
-    deadline,
+    deadline: { controller, signal, timeoutId },
     onClose,
     output,
     cleanup: createCleanupStack(),
@@ -383,12 +379,11 @@ function buildEvalContext(session) {
   return {
     bot: createAbortGuardedProxy(session, session.bot),
     snippets: loadSnippets(getSnippetsPath(session.config)),
-    goals,
     Vec3,
     print: (...args) => session.output.push(util.format(...args)),
     sleep: createSleep(session),
     withTimeout: createWithTimeout(session),
-    abort: session.signal,
+    abort: session.deadline.signal,
     timers: createBlockedTimers(),
   };
 }
@@ -400,7 +395,7 @@ async function executeUserCode(context, code) {
   // instead of Node's process-wide timer globals.
   const body = `return (async () => { ${code} })();`;
   const fn = new Function(
-    "bot", "snippets", "goals", "Vec3", "print", "sleep", "withTimeout",
+    "bot", "snippets", "Vec3", "print", "sleep", "withTimeout",
     "abort",
     "setTimeout", "clearTimeout",
     "setInterval", "clearInterval",
@@ -411,7 +406,6 @@ async function executeUserCode(context, code) {
   await fn(
     context.bot,
     context.snippets,
-    context.goals,
     context.Vec3,
     context.print,
     context.sleep,
@@ -428,14 +422,14 @@ async function executeUserCode(context, code) {
 
 // Abort outstanding request work, run cleanup, and restore patches.
 async function finishEvalSession(session) {
-  clearTimeout(session.deadline);
+  clearTimeout(session.deadline.timeoutId);
   session.res.off("close", session.onClose);
 
   // Force request-scoped awaitables and helpers to observe completion before
   // cleanup runs. On a normal success/error this reason is intentionally
   // "script-end" and is not reported to the client.
-  if (!session.signal.aborted) {
-    session.controller.abort(makeAbortError("script-end"));
+  if (!session.deadline.signal.aborted) {
+    session.deadline.controller.abort(makeAbortError("script-end"));
   }
 
   const cleanupErrors = await session.cleanup.run();
@@ -453,7 +447,7 @@ async function finishEvalSession(session) {
 
 // Translate session outcome into the final HTTP response.
 function writeEvalResult(session, scriptError, cleanupErrors) {
-  const reason = abortReasonTag(session.signal.reason);
+  const reason = abortReasonTag(session.deadline.signal.reason);
 
   if (reason === "client-disconnect") {
     if (scriptError) {
@@ -473,8 +467,19 @@ function writeEvalResult(session, scriptError, cleanupErrors) {
   }
 
   if (reason === "deadline") {
+    const timeoutMs = session.config.defaultTimeoutMs;
+    const hint = [
+      `Your /eval script ran longer than this server's ${timeoutMs}ms`,
+      "per-request deadline and was aborted. This is a server-imposed cap,",
+      "not a bug in your script. To work within it: split long-running work",
+      "across multiple /eval calls, bound individual awaits with",
+      "withTimeout(ms, promise), and make sure loops have an exit condition.",
+      "The operator can raise the limit via the server's --timeout flag.",
+    ].join(" ");
     writeJson(session.res, 504, {
       error: "deadline exceeded",
+      timeoutMs,
+      hint,
       output: session.output.join("\n"),
       cleanupErrors: cleanupErrors.map((error) => error.message),
     });
@@ -526,7 +531,7 @@ function loadSnippets(snippetsPath) {
 // the real bot after the request has aborted. Sub-objects are recursively
 // proxied through a per-session cache so identity is stable within a request.
 function createAbortGuardedProxy(session, root) {
-  const { signal } = session;
+  const { signal } = session.deadline;
   const cache = new WeakMap();
 
   function wrap(target) {
@@ -576,8 +581,8 @@ function installRequestPatches(session) {
   patchBotAwaitables(session);
   patchDigging(session);
   patchContainers(session);
-  patchPathfinder(session);
-  patchCombat(session);
+  patchBotGoto(session);
+  patchBotFollow(session);
   patchItemUse(session);
 
   session.cleanup.deferOnce("timers", session.timers.clearAll);
@@ -661,7 +666,9 @@ function patchContainers(session) {
     "openVillager", "openBlock", "openEntity",
   ]) {
     patchMethod(session, session.bot, method, (original) => (...args) => {
-      if (session.signal.aborted) return Promise.reject(session.signal.reason);
+      if (session.deadline.signal.aborted) {
+        return Promise.reject(session.deadline.signal.reason);
+      }
       const originalPromise = callPromise(original, args);
       suppressOriginalPromise(originalPromise);
       const opening = originalPromise.then((window) => {
@@ -676,42 +683,53 @@ function patchContainers(session) {
         }
         return window;
       });
-      return trackPromise(session, raceAbort(session.signal, opening, null));
+      return trackPromise(
+        session,
+        raceAbort(session.deadline.signal, opening, null),
+      );
     });
   }
 }
 
-// Patch pathfinder goals so navigation intent is cleared.
-function patchPathfinder(session) {
-  const pathfinderApi = session.bot.pathfinder;
-
-  // goto(...) and setGoal(...) both latch the same navigation intent, so they
-  // share one cleanup key and one final setGoal(null).
-  patchCancelable(session, pathfinderApi, "goto", "pathfinder:goal", () => {
-    if (pathfinderApi && pathfinderApi.setGoal) pathfinderApi.setGoal(null);
+// Patch bot.goto so per-request abort is auto-injected.
+//
+// Eval callers do not pass a signal; we always thread session.deadline.signal
+// into the goto call so its internal cleanup (clearing forward/jump/sprint)
+// runs on script end. Then we race the call against the same signal so the
+// awaiter sees an AbortError rejection, matching the convention used by other
+// patched awaitables. Caller-provided options are otherwise preserved; only
+// `signal` is overridden.
+function patchBotGoto(session) {
+  patchMethod(session, session.bot, "goto", (original) => (goal, options) => {
+    if (session.deadline.signal.aborted) {
+      return Promise.reject(session.deadline.signal.reason);
+    }
+    const merged = { ...(options || {}), signal: session.deadline.signal };
+    const promise = callPromise(original, [goal, merged]);
+    suppressOriginalPromise(promise);
+    return trackPromise(
+      session,
+      raceAbort(session.deadline.signal, promise, null),
+    );
   });
-
-  patchMethod(
-    session,
-    pathfinderApi,
-    "setGoal",
-    (original) => (goal, dynamic) => {
-      if (goal !== null && goal !== undefined) {
-        session.cleanup.deferOnce("pathfinder:goal", () => original(null));
-      }
-      return original(goal, dynamic);
-    },
-  );
 }
 
-// Patch PvP attack state so combat is stopped on cleanup.
-function patchCombat(session) {
-  patchMethod(session, session.bot.pvp, "attack", (original) => (...args) => {
-    session.cleanup.deferOnce("pvp", () => {
-      if (session.bot.pvp && session.bot.pvp.stop) session.bot.pvp.stop();
+// Patch bot.follow the same way as bot.goto: thread session.deadline.signal so
+// the follow loop terminates with the script and its own clean-up runs.
+function patchBotFollow(session) {
+  patchMethod(session, session.bot, "follow", (original) =>
+    (target, options) => {
+      if (session.deadline.signal.aborted) {
+        return Promise.reject(session.deadline.signal.reason);
+      }
+      const merged = { ...(options || {}), signal: session.deadline.signal };
+      const promise = callPromise(original, [target, merged]);
+      suppressOriginalPromise(promise);
+      return trackPromise(
+        session,
+        raceAbort(session.deadline.signal, promise, null),
+      );
     });
-    return original(...args);
-  });
 }
 
 // Patch item activation so held-item use is deactivated.
@@ -734,26 +752,37 @@ function patchMethod(session, target, method, wrap) {
 // Wrap an awaitable method with abort racing and promise tracking.
 function patchAwaitable(session, target, method) {
   patchMethod(session, target, method, (original) => (...args) => {
-    if (session.signal.aborted) return Promise.reject(session.signal.reason);
+    if (session.deadline.signal.aborted) {
+      return Promise.reject(session.deadline.signal.reason);
+    }
     const promise = callPromise(original, args);
     suppressOriginalPromise(promise);
-    return trackPromise(session, raceAbort(session.signal, promise, null));
+    return trackPromise(
+      session,
+      raceAbort(session.deadline.signal, promise, null),
+    );
   });
 }
 
 // Wrap an awaitable method that has an explicit cancellation action.
 function patchCancelable(session, target, method, cleanupKey, cancel) {
   patchMethod(session, target, method, (original) => (...args) => {
-    if (session.signal.aborted) return Promise.reject(session.signal.reason);
+    if (session.deadline.signal.aborted) {
+      return Promise.reject(session.deadline.signal.reason);
+    }
     session.cleanup.deferOnce(cleanupKey, cancel);
     const promise = callPromise(original, args);
     suppressOriginalPromise(promise);
-    return trackPromise(session, raceAbort(session.signal, promise, () => {
+    const onAbort = () => {
       // Abort runs native cancellation immediately; mark the cleanup discharged
       // so the finally path does not repeat the same cancellation.
       cancel();
       session.cleanup.markDone(cleanupKey);
-    }));
+    };
+    return trackPromise(
+      session,
+      raceAbort(session.deadline.signal, promise, onAbort),
+    );
   });
 }
 
@@ -890,9 +919,13 @@ function createTimerScope() {
 
 // Create the abort-aware sleep helper exposed to eval scripts.
 function createSleep(session) {
-  return (ms, value) => {
-    const delay = createAbortableDelay(session.timers, session.signal, ms);
-    return trackPromise(session, delay.promise.then(() => value));
+  return (ms) => {
+    const delay = createAbortableDelay(
+      session.timers,
+      session.deadline.signal,
+      ms,
+    );
+    return trackPromise(session, delay.promise);
   };
 }
 
@@ -904,7 +937,11 @@ function createWithTimeout(session) {
       throw new TypeError("withTimeout(ms, promise) requires a promise");
     }
 
-    const delay = createAbortableDelay(session.timers, session.signal, ms);
+    const delay = createAbortableDelay(
+      session.timers,
+      session.deadline.signal,
+      ms,
+    );
     const result = Promise.race([
       Promise.resolve(promise),
       delay.promise.then(() => { throw makeTimeoutError(delay.ms); }),

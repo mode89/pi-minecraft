@@ -14,9 +14,8 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
   JS
   ```
 - Your code runs inside `async () => { <your code> }`.
-- In scope: `bot`, `snippets`, `goals`, `Vec3`, `print`, `sleep`,
-  `withTimeout`, `abort`. User snippets, when defined, are available as
-  `snippets.*`.
+- In scope: `bot`, `snippets`, `Vec3`, `print`, `sleep`, `withTimeout`,
+  `abort`. User snippets, when defined, are available as `snippets.*`.
 - **Only `print(...)` output is returned.** Return values are discarded.
 - On error the server returns JSON `{error, stack, output, cleanupErrors}`
   with status 500. On per-request deadline, status 504 with the same shape
@@ -24,20 +23,20 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
 - Each request is **hermetic**: behavior/intent state your script
   introduces is rolled back when the script settles, when the client
   disconnects, or when the per-request deadline fires. This includes:
-  control states (`setControlState`), pathfinder goals, pvp targets, event
-  listeners you add (`bot.on/once/addListener`), open containers,
+  control states (`setControlState`), in-flight `bot.goto(...)` calls,
+  event listeners you add (`bot.on/once/addListener`), open containers,
   `activateItem`, and any pending request-scoped `sleep(...)` /
   `withTimeout(...)` handles. Game state (position, inventory, broken/placed
   blocks) is **not** rolled back — those are real side effects on the
   world.
-- `sleep(ms[, value])` is an abort-aware delay helper. Use `await sleep(ms)`
+- `sleep(ms)` is an abort-aware delay helper. Use `await sleep(ms)`
   instead of raw timers. `setTimeout`, `setInterval`, and `setImmediate`
   are disabled in script scope.
 - `withTimeout(ms, promise)` rejects with `TimeoutError` if `promise` does not
   settle within `ms`; it rejects with `AbortError` if the request aborts first.
   It does not cancel the underlying operation by itself.
 - `abort` is an `AbortSignal` that fires on client disconnect or deadline.
-  Long-running `bot` awaitables (`goto`, `dig`, `equip`, `craft`,
+  Long-running `bot` awaitables (`bot.goto`, `dig`, `equip`, `craft`,
   `placeBlock`, `lookAt`, `openContainer`, …), `sleep(...)`, and
   `withTimeout(...)` reject with `AbortError` when it fires. You rarely need
   to reference `abort` directly — just `await` the op and let it bail.
@@ -56,14 +55,52 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
     `bot.setControlState('forward', true)`
   - Social: `bot.chat(msg)`, `bot.whisper(user, msg)`, `bot.players`,
     `bot.entities`, `bot.nearestEntity(filter)`
-- `bot.pathfinder` + `goals`:
-  - `await bot.pathfinder.goto(new goals.GoalNear(x, y, z, r))`
-  - Other goals: `GoalBlock`, `GoalXZ`, `GoalFollow`, `GoalLookAtBlock`
-- `bot.pvp`: `bot.pvp.attack(entity)`, `bot.pvp.stop()`
+
+- `bot.goto(goal, options?)` — local A*-driven walker. `goal` is either a block
+  position `{x, y, z}` (or a `Vec3`), in which case the bot tries to stand on
+  that exact block, or a distance function `({x, y, z}) => number` that returns
+  the distance from a candidate block to the target — any block whose distance
+  is `<= 0.5` counts as arrived. Use the function form to say "get within N
+  blocks of P" or "reach any block matching a predicate": e.g.
+  `(p) => target.distanceTo(p) - 3` (where `target` is a `Vec3`) arrives
+  within 3 blocks of `target`. Must be admissible (a true lower bound on the
+  path cost from `p` to the goal) for A* to find an optimal path. Resolves with
+  `undefined` on arrival; on failure throws:
+  - `GotoError` with `status`:
+    - `"unreachable"` — A* drained the open set; no path exists.
+    - `"limit"` — A* hit `maxNodes` (default 10000) before finding a path.
+    - `"stuck"` — the walker made no progress for ~2s mid-route (mob in
+      the way, world changed since planning, etc.).
+  - `AbortError` — the request was aborted (client disconnect or deadline).
+
+  Every `GotoError` also carries `closest: {x, y, z}` (the block the bot
+  got nearest to the goal — closest expanded A* node for planning failures,
+  bot's stopped position for stuck) and `distance` (its distance to the
+  goal). Use them to log progress or to retry from a closer waypoint.
+
+  Movement model: 4 cardinals plus 4 same-level diagonals, step-up 1,
+  step-down ≤3, no parkour, swimming, doors, ladders, or fluids. Plan once and
+  walk; there is no replanning if the world changes mid-route. Always wrap
+  calls in `try/catch` if you want to recover from failure.
+
+- `bot.follow(target, options?)` — follow a moving target until aborted.
+  `target` is either an entity (any object with a `.position` Vec3, e.g.
+  `bot.players[name].entity`) or a `(pos) => distance` function (same form as
+  `bot.goto`'s distance-function goal). For entity targets, `range` (default 5)
+  is the desired stand-off distance; for function targets, bake the offset into
+  the function (the `range` option is ignored). Replans periodically as the
+  target moves, retries silently on stuck or unreachable, and never resolves on
+  its own — always run it under a bounded abort (deadline, timer, or
+  sentinel-driven controller) and expect it to throw `AbortError` when you stop
+  it.
+
 - `bot.autoEat`: auto-eats when hungry; `await bot.autoEat.eat()` to force
+
 - `bot.hawkEye`: ranged aim/shoot helpers
   (`bot.hawkEye.oneShot(target, weapon)`)
+
 - `Vec3(x, y, z)` for positions and offsets
+
 - `bot.registry` (minecraft-data for the server's version) — static lookup
   tables for every block, item, entity, biome, effect, etc. Use it to turn
   names into IDs (and vice versa) and to inspect game-data properties without
@@ -103,8 +140,8 @@ exports.positionKey = (pos) => [
 ```
 
 Use snippets to remove repeated boilerplate, not to hide task-specific plans.
-Pass the current `bot`, `goals`, `Vec3`, or other eval-scope values explicitly
-when a helper needs them:
+Pass the current `bot`, `Vec3`, or other eval-scope values explicitly when a
+helper needs them:
 ```js
 const logs = snippets.countItem(bot, "oak_log")
 print("oak_log", logs, "at", snippets.positionKey(bot.entity.position))
@@ -158,10 +195,14 @@ you genuinely need the output of one to decide the next.
   eagerly; print successes tersely.
 - **Wrap risky ops in try/catch** and `print` the error message; don't let the
   whole script 500 when a partial result is useful.
-- **Guard pathfinding.** Prefer `GoalNear(..., radius>=1)` over exact blocks;
-  pathfinder can hang on unreachable targets. The per-request deadline is
-  your safety net, but for tighter bounds you can use `withTimeout(...)` or
-  check `abort.aborted` between steps.
+- **Guard pathfinding.** `bot.goto` throws `GotoError` on failure with
+  `status` "unreachable", "limit", or "stuck", plus `closest` and `distance`
+  fields telling you how close you got; wrap calls in `try/catch` if you
+  want to recover. Pick a stand-able block adjacent to your real target
+  rather than the inside of an obstacle. The walker has no replanning, so
+  for moving targets, loop: `goto`, observe, decide, `goto` again. If a
+  route requires swimming, doors, ladders, parkour, or fluids the walker
+  throws "unreachable".
 - **Floor coords** when addressing blocks: `Math.floor(bot.entity.position.x)`.
 - **Keep scripts short and idempotent.** No global mutation, no
   `process.exit`, no unbounded background loops or CPU-bound infinite loops.
@@ -192,8 +233,16 @@ if (!targetLog) {
     return
 }
 
-const { x, y, z } = targetLog.position
-await bot.pathfinder.goto(new goals.GoalNear(x, y, z, 2))
+const log = targetLog.position
+// Get within reach of the log: a distance-function goal lets A* pick
+// whichever stand-able neighbor is cheapest, instead of hardcoding one face.
+try {
+    await bot.goto((p) => log.distanceTo(p) - 2)
+} catch (error) {
+    print("abort: goto", error.status, "d=" + error.distance.toFixed(2))
+    return
+}
+await bot.lookAt(targetLog.position)
 await bot.dig(bot.blockAt(targetLog.position))
 
 const oakLogCount = bot.inventory
@@ -203,19 +252,23 @@ const oakLogCount = bot.inventory
 print("ok: mined oak_log, have", oakLogCount, "at", bot.entity.position)
 ```
 
-**Guarded action with verification** — try/catch, print outcome. The
-per-request deadline and `abort` signal handle the timeout case for you;
-you only need a manual race for tighter local bounds:
+**Guarded action with verification** — catch `GotoError` to recover from
+planning/walking failure; let `AbortError` escape on client disconnect or
+deadline:
 ```js
 const startPosition = bot.entity.position.clone()
 
 try {
-    await bot.pathfinder.goto(new goals.GoalNear(x, y, z, 1))
+    await bot.goto({ x, y, z })
     print("ok: moved", startPosition, "->", bot.entity.position)
 } catch (error) {
-    // AbortError means client disconnect or deadline; pathfinder also
-    // throws GoalChanged / NoPath / Timeout for its own reasons.
-    print("fail:", error.name, error.message, "at:", bot.entity.position)
+    if (error.name === "GotoError") {
+        print("fail: goto", error.status,
+            "closest:", error.closest, "d=" + error.distance.toFixed(2))
+    } else {
+        // AbortError means client disconnect or deadline; let it propagate.
+        throw error
+    }
 }
 ```
 

@@ -200,7 +200,6 @@ test("server deadline aborts sleep and cleans temporary state", async (t) => {
   const response = await post(url, `
     bot.setControlState('jump', true)
     bot.on('physicTick', () => {})
-    bot.pathfinder.setGoal({ name: 'temporary' })
     await sleep(1000)
   `);
 
@@ -212,7 +211,6 @@ test("server deadline aborts sleep and cleans temporary state", async (t) => {
   });
   assert.equal(bot.controlState.jump, false);
   assert.equal(bot.listenerCount("physicTick"), 1);
-  assert.equal(bot.pathfinder.goal, null);
 });
 
 test("temporary state is cleaned after success and "
@@ -336,12 +334,10 @@ test("detached eval continuation cannot mutate bot after abort", async (t) => {
 
   await abandonPost(url, `
     const setControlState = bot.setControlState
-    const pathfinder = bot.pathfinder
     try { await sleep(10000) } catch {}
     for (const action of [
       () => bot.setControlState('jump', true),
       () => setControlState('jump', true),
-      () => pathfinder.setGoal({ name: 'late-goal' }),
     ]) {
       try { action() } catch {}
     }
@@ -349,7 +345,6 @@ test("detached eval continuation cannot mutate bot after abort", async (t) => {
   await delay(50);
 
   assert.equal(!!bot.controlState.jump, false);
-  assert.equal(bot.pathfinder.goal, null);
 });
 
 test("client disconnect suppresses nested dig abort rejections", async (t) => {
@@ -373,37 +368,35 @@ test("client disconnect suppresses nested dig abort rejections", async (t) => {
   }
 });
 
-test("fire-and-forget patched awaitables are aborted "
-  + "and cleaned", async (t) => {
+test("fire-and-forget bot.goto is aborted and cleaned", async (t) => {
   const { bot, url } = await createFixture(t);
 
   const response = await post(url, `
-    bot.pathfinder.goto({ name: 'unawaited-goal' })
+    bot.goto({ x: 5, y: 64, z: 5 })
     print('started')
   `);
 
   assert.deepEqual(response, { status: 200, body: "started\n" });
-  assert.equal(bot.pathfinder.goal, null);
+  // The fake goto sets forward while running and clears it in its finally on
+  // abort; assert the cleanup ran.
+  assert.equal(!!bot.controlState.forward, false);
+  assert.equal(bot.gotoAborted, true);
 });
 
-test("open windows, activated items, and pvp targets "
-  + "are cleaned", async (t) => {
+test("open windows and activated items are cleaned", async (t) => {
   const { bot, url } = await createFixture(t);
 
   const response = await post(url, `
     await bot.openContainer({})
     bot.activateItem()
-    bot.pvp.attack({ username: 'target' })
     print('window', !!bot.currentWindow)
     print('using', !!bot.usingHeldItem)
-    print('pvp', !!bot.pvp.target)
   `);
 
   assert.equal(response.status, 200);
-  assert.equal(response.body, "window true\nusing true\npvp true\n");
+  assert.equal(response.body, "window true\nusing true\n");
   assert.equal(bot.currentWindow, null);
   assert.equal(bot.usingHeldItem, false);
-  assert.equal(bot.pvp.target, null);
 });
 
 test("lookAt abort recovery", async (t) => {
@@ -593,19 +586,25 @@ function createFakeBot() {
     if (bot.currentWindow === window) bot.currentWindow = null;
   };
 
-  bot.pathfinder = {
-    goal: null,
-    setGoal(goal) { this.goal = goal; },
-    goto(goal) {
-      this.goal = goal;
-      return new Promise(() => {});
-    },
-  };
-
-  bot.pvp = {
-    target: null,
-    attack(target) { this.target = target; },
-    stop() { this.target = null; },
+  bot.gotoAborted = false;
+  bot.goto = async (goal, options = {}) => {
+    bot.lastGoal = goal;
+    bot.setControlState("forward", true);
+    try {
+      await new Promise((resolve) => {
+        const signal = options.signal;
+        if (!signal) return; // Hangs forever without a signal; tests pass one.
+        if (signal.aborted) { resolve(); return; }
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      bot.gotoAborted = true;
+      if (options.signal && options.signal.aborted) {
+        throw options.signal.reason;
+      }
+      return { status: "arrived" };
+    } finally {
+      bot.setControlState("forward", false);
+    }
   };
 
   bot.on("physicTick", () => {});
@@ -616,7 +615,6 @@ function mutateTemporaryState(tail) {
   return `
     bot.setControlState('jump', true)
     bot.on('physicTick', () => {})
-    bot.pathfinder.setGoal({ name: 'temporary' })
     ${tail}
   `;
 }
@@ -624,7 +622,6 @@ function mutateTemporaryState(tail) {
 function assertClean(bot) {
   assert.equal(!!bot.controlState.jump, false);
   assert.equal(bot.listenerCount("physicTick"), 1);
-  assert.equal(bot.pathfinder.goal, null);
 }
 
 async function post(url, body) {
