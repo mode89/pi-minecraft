@@ -77,7 +77,8 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
   goal). Use them to log progress or to retry from a closer waypoint.
 
   Movement model: 4 cardinals plus 4 same-level diagonals, step-up 1,
-  step-down ≤3, no parkour, swimming, doors, ladders, or fluids. Plan once and
+  step-down ≤3, cardinal jumps over single-block gaps, no other parkour,
+  swimming, doors, ladders, or fluids. Plan once and
   walk; there is no replanning if the world changes mid-route. Always wrap
   calls in `try/catch` if you want to recover from failure.
 

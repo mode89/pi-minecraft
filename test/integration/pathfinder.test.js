@@ -38,6 +38,79 @@ describe("goto", () => {
     });
   });
 
+  test("jumps over a single block cardinal gap", opts, async () => {
+    const map = [["stone", null, "stone"]];
+    await withWorld(map, { x: 0.5, y: 1, z: 0.5 }, async (evalScript) => {
+      const out = await evalScript(`
+        await bot.goto(world(2, 1, 0));
+        const p = bot.entity.position;
+        print(
+          (p.x - ORIGIN.x).toFixed(2),
+          (p.y - ORIGIN.y).toFixed(2),
+          (p.z - ORIGIN.z).toFixed(2),
+        );
+      `);
+      const [x, y, z] = out.trim().split(/\s+/).map(Number);
+      assert.ok(
+        Math.hypot(x - 2.5, z - 0.5) < 1.0,
+        `bot ended at local (${x}, ${z}); expected near (2.5, 0.5)`,
+      );
+      assert.ok(
+        Math.abs(y - 1) < 0.5,
+        `bot ended at y=${y}; expected near 1`,
+      );
+    });
+  });
+
+  test("jumps over a single block cardinal gap when initially facing away",
+    opts, async () => {
+      const map = [["stone", null, "stone"]];
+      await withWorld(map, { x: 0.1, y: 1, z: 0.5 }, async (evalScript) => {
+        const out = await evalScript(`
+          const awayYaw = Math.PI / 2;
+          await bot.look(awayYaw, 0);
+          const yawDelta = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
+          const deadline = Date.now() + 5000;
+          while (Math.abs(yawDelta(bot.entity.yaw, awayYaw)) > 0.05) {
+            if (Date.now() > deadline) throw new Error("rotation timed out");
+            await sleep(50);
+          }
+          await bot.goto(world(2, 1, 0));
+          const p = bot.entity.position;
+          print(
+            (p.x - ORIGIN.x).toFixed(2),
+            (p.y - ORIGIN.y).toFixed(2),
+            (p.z - ORIGIN.z).toFixed(2),
+          );
+        `);
+        const [x, y, z] = out.trim().split(/\s+/).map(Number);
+        assert.ok(
+          Math.hypot(x - 2.5, z - 0.5) < 1.0,
+          `bot ended at local (${x}, ${z}); expected near (2.5, 0.5)`,
+        );
+        assert.ok(
+          y >= 1 && y < 1.6,
+          `bot ended at y=${y}; expected on or above landing block`,
+        );
+      });
+    });
+
+  test("refuses a cardinal gap jump with blocked gap headroom", opts,
+    async () => {
+      const map = [["stone", [null, null, null, "stone"], "stone"]];
+      await withWorld(map, { x: 0.5, y: 1, z: 0.5 }, async (evalScript) => {
+        const out = await evalScript(`
+          try {
+            await bot.goto(world(2, 1, 0));
+            print("ok");
+          } catch (e) {
+            print(e.constructor.name, e.status);
+          }
+        `);
+        assert.equal(out.trim(), "GotoError unreachable");
+      });
+    });
+
   test("climbs a single step-up", opts, async () => {
     // x=0 single block (stand y=1); x=1 two-tall column (stand y=2).
     const map = [[["stone"], ["stone", "stone"]]];

@@ -383,6 +383,77 @@ test("planPath handles a single step-up", () => {
   ]);
 });
 
+test("planPath jumps over a single block cardinal gap", () => {
+  // x=1 has no floor, but x=2 is same-level landing ground.
+  const map = [[[1], [0], [1]]];
+  const bot = createFakeBot(map);
+
+  const result = planPath(
+    bot,
+    { x: 0, y: 1, z: 0 },
+    { x: 2, y: 1, z: 0 },
+  );
+
+  assert.equal(result.status, "found");
+  assert.equal(result.cost, 2);
+  assert.deepEqual(result.path, [
+    { x: 0, y: 1, z: 0 },
+    { x: 2, y: 1, z: 0 },
+  ]);
+});
+
+test("planPath refuses a cardinal gap jump with blocked start headroom", () => {
+  const map = [[[1, 0, 0, 1], [0], [1]]];
+  const bot = createFakeBot(map);
+
+  const result = planPath(
+    bot,
+    { x: 0, y: 1, z: 0 },
+    { x: 2, y: 1, z: 0 },
+  );
+
+  assert.equal(result.status, "exhausted");
+});
+
+test("planPath refuses a cardinal gap jump with blocked gap headroom", () => {
+  const map = [[[1], [0, 0, 0, 1], [1]]];
+  const bot = createFakeBot(map);
+
+  const result = planPath(
+    bot,
+    { x: 0, y: 1, z: 0 },
+    { x: 2, y: 1, z: 0 },
+  );
+
+  assert.equal(result.status, "exhausted");
+});
+
+test("planPath refuses a cardinal gap jump with blocked landing headroom", () => {
+  const map = [[[1], [0], [1, 0, 0, 1]]];
+  const bot = createFakeBot(map);
+
+  const result = planPath(
+    bot,
+    { x: 0, y: 1, z: 0 },
+    { x: 2, y: 1, z: 0 },
+  );
+
+  assert.equal(result.status, "exhausted");
+});
+
+test("planPath refuses two-block cardinal gaps", () => {
+  const map = [[[1], [0], [0], [1]]];
+  const bot = createFakeBot(map);
+
+  const result = planPath(
+    bot,
+    { x: 0, y: 1, z: 0 },
+    { x: 3, y: 1, z: 0 },
+  );
+
+  assert.equal(result.status, "exhausted");
+});
+
 test("planPath handles step-down within the 3-block limit", () => {
   // x=0 column 3 tall (stand y=3); x=1 column 1 tall (stand y=1). Drop = 2.
   const map = [[[1, 1, 1], [1]]];

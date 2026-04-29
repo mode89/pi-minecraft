@@ -171,46 +171,53 @@ async function walkPath(bot, path, { stopWhen = () => false } = {}) {
   }
 }
 
-// Drive the bot to a single standing position, ticking until arrival.
-// Returns early when `stopWhen` becomes true. Throws a
-// GotoError({status: "stuck"}) if the waypoint becomes unstandable or the
-// bot makes no progress for `stuckLimit` ticks.
+// Drive the bot to a standing position; returns on arrival/stopWhen.
+// Throws GotoError(stuck) if the waypoint invalidates or progress stalls.
 async function walkToWaypoint(bot, target, { stopWhen = () => false } = {}) {
-  const stuckLimit = 40;
-  let bestDistance = Infinity;
-  let stuckTicks = 0;
+  const start = floorPos(bot.entity.position);
+  if (isCardinalJump(start, target)) {
+    await gapJump(bot, start, target, { stopWhen });
+  } else if (target.y > start.y) {
+    await stepJump(bot, target, { stopWhen });
+  } else {
+    await directWalk(bot, target, { stopWhen });
+  }
+}
+
+async function directWalk(bot, target, { stopWhen = () => false } = {}) {
+  const guardStuck = createStuckGuard();
 
   while (true) {
     if (stopWhen()) return;
+    validateWaypoint(bot, target);
 
-    // Re-validate the waypoint each tick so we notice world changes.
-    if (!isStandable(bot, target.x, target.y, target.z)) {
-      throw new GotoError({ status: "stuck" });
-    }
-    const tx = target.x + 0.5;
-    const tz = target.z + 0.5;
-    const pos = bot.entity.position;
-    // Horizontal-only distance: gravity and the jump key handle y, so chasing
-    // vertical alignment would just keep us steering at a waypoint we've
-    // already passed in X/Z (which whips lookAt around mid-fall).
-    const dist = Math.hypot(tx - pos.x, tz - pos.z);
-
-    // Vertical check too: on a step-down the bot crosses the horizontal
-    // cutoff while still partly supported by the higher block.
+    const { pos, dist, yaw } = motionToWaypoint(bot, target);
     if (dist < 0.3 && Math.abs(pos.y - target.y) < 0.5) return;
+    guardStuck(dist);
 
-    if (dist < bestDistance - 0.01) {
-      bestDistance = dist;
-      stuckTicks = 0;
-    } else if (++stuckTicks > stuckLimit) {
-      throw new GotoError({ status: "stuck" });
-    }
+    // Only yaw affects horizontal motion; keep pitch level to avoid
+    // head-diving at step-down waypoints. Mineflayer yaw=0 faces -z.
+    await bot.look(yaw, 0);
 
-    // Only yaw affects horizontal motion in mineflayer; keep pitch level so
-    // the head doesn't dive at step-down waypoints. Mineflayer convention:
-    // yaw=0 faces -z, increasing counter-clockwise viewed from above.
-    const yaw = Math.atan2(pos.x - tx, pos.z - tz);
-    await bot.look(yaw, 0, true);
+    bot.setControlState("forward", true);
+    bot.setControlState("jump", false);
+
+    await bot.waitForTicks(1);
+  }
+}
+
+async function stepJump(bot, target, { stopWhen = () => false } = {}) {
+  const guardStuck = createStuckGuard();
+
+  while (true) {
+    if (stopWhen()) return;
+    validateWaypoint(bot, target);
+
+    const { pos, dist, yaw } = motionToWaypoint(bot, target);
+    if (dist < 0.3 && Math.abs(pos.y - target.y) < 0.5) return;
+    guardStuck(dist);
+
+    await bot.look(yaw, 0);
 
     bot.setControlState("forward", true);
     bot.setControlState("jump", target.y > Math.floor(pos.y));
@@ -219,8 +226,124 @@ async function walkToWaypoint(bot, target, { stopWhen = () => false } = {}) {
   }
 }
 
-// Yield 4-cardinal neighbors with same-level walks, step-up 1, and step-down
-// 3, plus 4 diagonal same-level neighbors at sqrt(2) cost.
+async function gapJump(bot, start, target, { stopWhen = () => false } = {}) {
+  const guardStuck = createStuckGuard();
+  const isAtTakeoff = (pos) => {
+    const threshold = 0.75;
+    const dx = Math.sign(target.x - start.x);
+    const dz = Math.sign(target.z - start.z);
+    if (dx > 0) return pos.x >= start.x + threshold;
+    if (dx < 0) return pos.x <= start.x + 1 - threshold;
+    if (dz > 0) return pos.z >= start.z + threshold;
+    return pos.z <= start.z + 1 - threshold;
+  };
+  const isYawAligned = (current, targetYaw) => {
+    const delta = Math.atan2(
+      Math.sin(current - targetYaw),
+      Math.cos(current - targetYaw),
+    );
+    return Math.abs(delta) < 0.05;
+  };
+
+  // First face the landing, then walk to the takeoff edge.
+  while (true) {
+    if (stopWhen()) return;
+    validateWaypoint(bot, target);
+
+    const { yaw } = motionToWaypoint(bot, target);
+    await bot.look(yaw, 0);
+    if (isYawAligned(bot.entity.yaw, yaw)) break;
+    stopMovement(bot);
+    await bot.waitForTicks(1);
+  }
+
+  while (true) {
+    if (stopWhen()) return;
+    validateWaypoint(bot, target);
+
+    const { pos, dist, yaw } = motionToWaypoint(bot, target);
+    if (isAtTakeoff(pos)) break;
+    guardStuck(dist);
+
+    await bot.look(yaw, 0);
+    bot.setControlState("forward", isYawAligned(bot.entity.yaw, yaw));
+    bot.setControlState("jump", false);
+    await bot.waitForTicks(1);
+  }
+
+  while (true) {
+    if (stopWhen()) return;
+    validateWaypoint(bot, target);
+
+    const { pos, dist, yaw } = motionToWaypoint(bot, target);
+    if (dist < 0.3) {
+      if (Math.abs(pos.y - target.y) < 0.2) return;
+      stopMovement(bot);
+      await bot.waitForTicks(1);
+      continue;
+    }
+    guardStuck(dist);
+
+    await bot.look(yaw, 0);
+    if (!isYawAligned(bot.entity.yaw, yaw)) {
+      stopMovement(bot);
+      await bot.waitForTicks(1);
+      continue;
+    }
+
+    bot.setControlState("forward", true);
+    bot.setControlState("jump", true);
+    await bot.waitForTicks(1);
+  }
+}
+
+function validateWaypoint(bot, target) {
+  // Re-validate the waypoint each tick so we notice world changes.
+  if (!isStandable(bot, target.x, target.y, target.z)) {
+    throw new GotoError({ status: "stuck" });
+  }
+}
+
+function createStuckGuard() {
+  const stuckLimit = 40;
+  let bestDistance = Infinity;
+  let stuckTicks = 0;
+
+  return (dist) => {
+    if (dist < bestDistance - 0.01) {
+      bestDistance = dist;
+      stuckTicks = 0;
+    } else if (++stuckTicks > stuckLimit) {
+      throw new GotoError({ status: "stuck" });
+    }
+  };
+}
+
+function stopMovement(bot) {
+  bot.setControlState("forward", false);
+  bot.setControlState("jump", false);
+}
+
+function motionToWaypoint(bot, target) {
+  const tx = target.x + 0.5;
+  const tz = target.z + 0.5;
+  const pos = bot.entity.position;
+  // Horizontal-only distance: gravity/jump handle y, and chasing vertical
+  // alignment whips lookAt around after passing a waypoint in X/Z.
+  const dist = Math.hypot(tx - pos.x, tz - pos.z);
+  const yaw = Math.atan2(pos.x - tx, pos.z - tz);
+  return { pos, dist, yaw };
+}
+
+// True iff a path edge is a same-level two-block cardinal jump.
+function isCardinalJump(from, to) {
+  const dx = Math.abs(to.x - from.x);
+  const dz = Math.abs(to.z - from.z);
+  return to.y === from.y && dx + dz === 2 && (dx === 0 || dz === 0);
+}
+
+// Yield cardinals with walk/step-up/step-down/gap-jump moves, plus
+// same-level diagonals at sqrt(2) cost.
 function* worldNeighbors(bot, p) {
   const cardinals = [[1, 0], [-1, 0], [0, 1], [0, -1]];
   for (const [dx, dz] of cardinals) {
@@ -236,6 +359,9 @@ function* worldNeighbors(bot, p) {
       continue;
     }
     yield* stepDownNeighbors(bot, p, nx, nz);
+    if (canJumpGap(bot, p, dx, dz)) {
+      yield { node: { x: p.x + 2 * dx, y: p.y, z: p.z + 2 * dz }, cost: 2 };
+    }
   }
 
   const diagonals = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
@@ -247,6 +373,23 @@ function* worldNeighbors(bot, p) {
       };
     }
   }
+}
+
+// True iff the bot can jump over one non-standable cardinal cell and land on
+// same-level ground two blocks away.
+function canJumpGap(bot, p, dx, dz) {
+  const mx = p.x + dx;
+  const mz = p.z + dz;
+  const lx = p.x + 2 * dx;
+  const lz = p.z + 2 * dz;
+
+  if (isStandable(bot, mx, p.y, mz)) return false;
+  if (!isBodyClear(bot, mx, p.y, mz)) return false;
+  if (!isStandable(bot, lx, p.y, lz)) return false;
+  if (!isPassable(bot, p.x, p.y + 2, p.z)) return false;
+  if (!isPassable(bot, mx, p.y + 2, mz)) return false;
+  if (!isPassable(bot, lx, p.y + 2, lz)) return false;
+  return true;
 }
 
 // True iff the bot can walk diagonally from p to (p.x+dx, p.y, p.z+dz).
