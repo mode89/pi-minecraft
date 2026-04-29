@@ -15,6 +15,14 @@ function main() {
     /sync_entity_position[\s\S]*?entity\.pitch = (packet\.pitch)/,
     "-packet.pitch * Math.PI/180",
   );
+
+  // blockAtEntityCursor uses entity.height (top of head) as eye offset; use
+  // entity.eyeHeight instead so the raycast originates from the eyes.
+  patch(
+    "mineflayer/lib/plugins/ray_trace.js",
+    /const eyePosition = position\.offset\(0, (height), 0\)/,
+    "entity.eyeHeight",
+  );
 }
 
 function patch(relPath, regex, replacement) {
