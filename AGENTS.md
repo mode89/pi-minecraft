@@ -24,3 +24,9 @@ This is the operator prompt injected into Pi's system prompt while the managed r
 ## `README.md`
 
 Keep it user-facing and concise.
+
+## Postinstall patches `scripts/patches.js`
+
+Runs as `npm` `postinstall` to patch files under `node_modules/`:
+- Defines a `patch(relPath, regex, replacement)` helper. The regex may have one optional capture group; if present, only that group's span is replaced.
+- Add a comment near each `patch(...)` call explaining why it is needed.
